@@ -10,211 +10,64 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
-from decimal import Decimal
+import json
 
-import boto3.session
-from boto3.compat import collections_abc
-from boto3.dynamodb.conditions import Attr, Key
-from boto3.dynamodb.types import Binary
-from tests import unique_id, unittest
+from botocore.awsrequest import AWSResponse
+
+from boto3.dynamodb.conditions import Attr
+from boto3.session import Session
+from tests import mock, unittest
 
 
-class BaseDynamoDBTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.session = boto3.session.Session(region_name='us-west-2')
-        cls.dynamodb = cls.session.resource('dynamodb')
-        cls.table_name = unique_id('boto3db')
-        cls.item_data = {
-            'MyHashKey': 'mykey',
-            'MyNull': None,
-            'MyBool': True,
-            'MyString': 'mystring',
-            'MyNumber': Decimal('1.25'),
-            'MyBinary': Binary(b'\x01'),
-            'MyStringSet': {'foo'},
-            'MyNumberSet': {Decimal('1.25')},
-            'MyBinarySet': {Binary(b'\x01')},
-            'MyList': ['foo'],
-            'MyMap': {'foo': 'bar'},
+class TestDynamoDB(unittest.TestCase):
+    def setUp(self):
+        self.http_response = AWSResponse(None, 200, {}, None)
+        self.parsed_response = {}
+        self.make_request_patch = mock.patch(
+            'botocore.endpoint.Endpoint.make_request'
+        )
+        self.make_request_mock = self.make_request_patch.start()
+        self.make_request_mock.return_value = (
+            self.http_response,
+            self.parsed_response,
+        )
+        self.session = Session(
+            aws_access_key_id='dummy',
+            aws_secret_access_key='dummy',
+            region_name='us-east-1',
+        )
+
+    def tearDown(self):
+        self.make_request_patch.stop()
+
+    def test_resource(self):
+        dynamodb = self.session.resource('dynamodb')
+        table = dynamodb.Table('MyTable')
+        # Make sure it uses the high level interface
+        table.scan(FilterExpression=Attr('mykey').eq('myvalue'))
+        request = self.make_request_mock.call_args_list[0][0][1]
+        request_params = json.loads(request['body'].decode('utf-8'))
+        assert request_params == {
+            'TableName': 'MyTable',
+            'FilterExpression': '#n0 = :v0',
+            'ExpressionAttributeNames': {'#n0': 'mykey'},
+            'ExpressionAttributeValues': {':v0': {'S': 'myvalue'}},
         }
-        cls.table = cls.dynamodb.create_table(
-            TableName=cls.table_name,
-            ProvisionedThroughput={
-                "ReadCapacityUnits": 5,
-                "WriteCapacityUnits": 5,
-            },
-            KeySchema=[{"AttributeName": "MyHashKey", "KeyType": "HASH"}],
-            AttributeDefinitions=[
-                {"AttributeName": "MyHashKey", "AttributeType": "S"}
-            ],
+
+    def test_client(self):
+        dynamodb = self.session.client('dynamodb')
+        # Make sure the client still uses the botocore level interface
+        dynamodb.scan(
+            TableName='MyTable',
+            FilterExpression='#n0 = :v0',
+            ExpressionAttributeNames={'#n0': 'mykey'},
+            ExpressionAttributeValues={':v0': {'S': 'myvalue'}},
         )
-        waiter = cls.dynamodb.meta.client.get_waiter('table_exists')
-        waiter.wait(TableName=cls.table_name)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.table.delete()
-
-
-class TestDynamoDBTypes(BaseDynamoDBTest):
-    def test_put_get_item(self):
-        self.table.put_item(Item=self.item_data)
-        self.addCleanup(self.table.delete_item, Key={'MyHashKey': 'mykey'})
-        response = self.table.get_item(
-            Key={'MyHashKey': 'mykey'}, ConsistentRead=True
-        )
-        self.assertEqual(response['Item'], self.item_data)
-
-
-class TestDynamoDBConditions(BaseDynamoDBTest):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.table.put_item(Item=cls.item_data)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.table.delete_item(Key={'MyHashKey': 'mykey'})
-        super().tearDownClass()
-
-    def scan(self, filter_expression):
-        return self.table.scan(
-            FilterExpression=filter_expression, ConsistentRead=True
-        )
-
-    def query(self, key_condition_expression, filter_expression=None):
-        kwargs = {
-            'KeyConditionExpression': key_condition_expression,
-            'ConsistentRead': True,
+        request = self.make_request_mock.call_args_list[0][0][1]
+        request_params = json.loads(request['body'].decode('utf-8'))
+        assert request_params == {
+            'TableName': 'MyTable',
+            'FilterExpression': '#n0 = :v0',
+            'ExpressionAttributeNames': {'#n0': 'mykey'},
+            'ExpressionAttributeValues': {':v0': {'S': 'myvalue'}},
         }
-        if filter_expression is not None:
-            kwargs['FilterExpression'] = filter_expression
-        return self.table.query(**kwargs)
-
-    def test_filter_expression(self):
-        r = self.scan(filter_expression=Attr('MyHashKey').eq('mykey'))
-        self.assertEqual(r['Items'][0]['MyHashKey'], 'mykey')
-
-    def test_key_condition_expression(self):
-        r = self.query(key_condition_expression=Key('MyHashKey').eq('mykey'))
-        self.assertEqual(r['Items'][0]['MyHashKey'], 'mykey')
-
-    def test_key_condition_with_filter_condition_expression(self):
-        r = self.query(
-            key_condition_expression=Key('MyHashKey').eq('mykey'),
-            filter_expression=Attr('MyString').eq('mystring'),
-        )
-        self.assertEqual(r['Items'][0]['MyString'], 'mystring')
-
-    def test_condition_less_than(self):
-        r = self.scan(filter_expression=Attr('MyNumber').lt(Decimal('1.26')))
-        self.assertTrue(r['Items'][0]['MyNumber'] < Decimal('1.26'))
-
-    def test_condition_less_than_equal(self):
-        r = self.scan(filter_expression=Attr('MyNumber').lte(Decimal('1.26')))
-        self.assertTrue(r['Items'][0]['MyNumber'] <= Decimal('1.26'))
-
-    def test_condition_greater_than(self):
-        r = self.scan(filter_expression=Attr('MyNumber').gt(Decimal('1.24')))
-        self.assertTrue(r['Items'][0]['MyNumber'] > Decimal('1.24'))
-
-    def test_condition_greater_than_equal(self):
-        r = self.scan(filter_expression=Attr('MyNumber').gte(Decimal('1.24')))
-        self.assertTrue(r['Items'][0]['MyNumber'] >= Decimal('1.24'))
-
-    def test_condition_begins_with(self):
-        r = self.scan(filter_expression=Attr('MyString').begins_with('my'))
-        self.assertTrue(r['Items'][0]['MyString'].startswith('my'))
-
-    def test_condition_between(self):
-        r = self.scan(
-            filter_expression=Attr('MyNumber').between(
-                Decimal('1.24'), Decimal('1.26')
-            )
-        )
-        self.assertTrue(r['Items'][0]['MyNumber'] > Decimal('1.24'))
-        self.assertTrue(r['Items'][0]['MyNumber'] < Decimal('1.26'))
-
-    def test_condition_not_equal(self):
-        r = self.scan(filter_expression=Attr('MyHashKey').ne('notmykey'))
-        self.assertNotEqual(r['Items'][0]['MyHashKey'], 'notmykey')
-
-    def test_condition_in(self):
-        r = self.scan(
-            filter_expression=Attr('MyHashKey').is_in(['notmykey', 'mykey'])
-        )
-        self.assertIn(r['Items'][0]['MyHashKey'], ['notmykey', 'mykey'])
-
-    def test_condition_exists(self):
-        r = self.scan(filter_expression=Attr('MyString').exists())
-        self.assertIn('MyString', r['Items'][0])
-
-    def test_condition_not_exists(self):
-        r = self.scan(filter_expression=Attr('MyFakeKey').not_exists())
-        self.assertNotIn('MyFakeKey', r['Items'][0])
-
-    def test_condition_contains(self):
-        r = self.scan(filter_expression=Attr('MyString').contains('my'))
-        self.assertIn('my', r['Items'][0]['MyString'])
-
-    def test_condition_size(self):
-        r = self.scan(
-            filter_expression=Attr('MyString').size().eq(len('mystring'))
-        )
-        self.assertEqual(len(r['Items'][0]['MyString']), len('mystring'))
-
-    def test_condition_attribute_type(self):
-        r = self.scan(filter_expression=Attr('MyMap').attribute_type('M'))
-        self.assertIsInstance(r['Items'][0]['MyMap'], collections_abc.Mapping)
-
-    def test_condition_and(self):
-        r = self.scan(
-            filter_expression=(
-                Attr('MyHashKey').eq('mykey') & Attr('MyString').eq('mystring')
-            )
-        )
-        item = r['Items'][0]
-        self.assertTrue(
-            item['MyHashKey'] == 'mykey' and item['MyString'] == 'mystring'
-        )
-
-    def test_condition_or(self):
-        r = self.scan(
-            filter_expression=(
-                Attr('MyHashKey').eq('mykey2')
-                | Attr('MyString').eq('mystring')
-            )
-        )
-        item = r['Items'][0]
-        self.assertTrue(
-            item['MyHashKey'] == 'mykey2' or item['MyString'] == 'mystring'
-        )
-
-    def test_condition_not(self):
-        r = self.scan(filter_expression=(~Attr('MyHashKey').eq('mykey2')))
-        item = r['Items'][0]
-        self.assertTrue(item['MyHashKey'] != 'mykey2')
-
-    def test_condition_in_map(self):
-        r = self.scan(filter_expression=Attr('MyMap.foo').eq('bar'))
-        self.assertEqual(r['Items'][0]['MyMap']['foo'], 'bar')
-
-    def test_condition_in_list(self):
-        r = self.scan(filter_expression=Attr('MyList[0]').eq('foo'))
-        self.assertEqual(r['Items'][0]['MyList'][0], 'foo')
-
-
-class TestDynamodbBatchWrite(BaseDynamoDBTest):
-    def test_batch_write_items(self):
-        num_elements = 1000
-        items = []
-        for i in range(num_elements):
-            items.append({'MyHashKey': f'foo{i}', 'OtherKey': f'bar{i}'})
-        with self.table.batch_writer() as batch:
-            for item in items:
-                batch.put_item(Item=item)
-
-        # Verify all the items were added to dynamodb.
-        for obj in self.table.scan(ConsistentRead=True)['Items']:
-            self.assertIn(obj, items)
