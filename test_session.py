@@ -10,38 +10,39 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+import botocore.session
+
 import boto3.session
 from tests import unittest
 
 
-class TestSession(unittest.TestCase):
+class TestUserAgentCustomizations(unittest.TestCase):
     def setUp(self):
-        self.session = boto3.session.Session(region_name='us-west-2')
+        self.botocore_session = botocore.session.get_session()
+        self.session = boto3.session.Session(
+            region_name='us-west-2', botocore_session=self.botocore_session
+        )
+        self.actual_user_agent = None
+        self.botocore_session.register(
+            'request-created', self.record_user_agent
+        )
 
-    def test_events_attribute(self):
-        # Create some function to register.
-        def my_handler(my_list, **kwargs):
-            return my_list.append('my_handler called')
+    def record_user_agent(self, request, **kwargs):
+        self.actual_user_agent = request.headers['User-Agent']
 
-        # Register the handler to the event.
-        self.session.events.register('myevent', my_handler)
+    def test_client_user_agent(self):
+        client = self.session.client('s3')
+        client.list_buckets()
+        self.assertIn('Boto3', self.actual_user_agent)
+        self.assertIn('Botocore', self.actual_user_agent)
+        self.assertIn('Python', self.actual_user_agent)
+        # We should *not* have any mention of resource
+        # when using clients directly.
+        self.assertNotIn('Resource', self.actual_user_agent)
 
-        initial_list = []
-        # Emit the event.
-        self.session.events.emit('myevent', my_list=initial_list)
-        # Ensure that the registered handler was called.
-        assert initial_list == ['my_handler called']
-
-    def test_can_access_region_property(self):
-        session = boto3.session.Session(region_name='us-west-1')
-        assert session.region_name == 'us-west-1'
-
-    def test_get_available_partitions(self):
-        partitions = self.session.get_available_partitions()
-        assert isinstance(partitions, list)
-        assert partitions
-
-    def test_get_available_regions(self):
-        regions = self.session.get_available_regions('s3')
-        assert isinstance(regions, list)
-        assert regions
+    def test_resource_user_agent_has_customization(self):
+        resource = self.session.resource('s3')
+        list(resource.buckets.all())
+        # We should have customized the user agent for
+        # resource calls with "Resource".
+        self.assertTrue(self.actual_user_agent.endswith(' Resource'))
